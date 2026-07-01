@@ -1,0 +1,254 @@
+import random
+import numpy as np
+import pandas as pd
+
+from copy import copy
+from datetime import datetime
+from tqdm import tqdm, tqdm_notebook
+
+
+def generate_solution(problem,
+                      alpha=1.0,
+                      betta=0.5,
+                      patience=50,
+                      verbose=False) -> np.ndarray:
+    MAXIMUM_PENALTY = 10000000
+    dists   = problem['dists']
+    demands = problem['demands']
+
+    for itr in range(patience):
+
+        i_loc   = [i for i in range(1, problem['n_locations'])]
+        routes  = [[0] for _ in range(problem['n_trucks'])]
+
+        for i in range(len(i_loc)):
+            route_dists = []
+            random_loc  = random.choice(i_loc)
+            counter     = 0
+            for route in routes:
+                dist_to_loc  = dists[route[-1]][random_loc]
+                route_demand = sum([demands[i] for i in route]) + demands[random_loc]
+                if counter > len(routes) / 2:
+                    random_loc  = random.choice(i_loc)
+                if  route_demand > problem['capacity']:
+                    coef = MAXIMUM_PENALTY
+                else:
+                    coef =   alpha * i * len(route) + \
+                             betta * max(0, route_demand-problem['capacity']) + \
+                             dist_to_loc
+                route_dists.append(coef)
+
+            routes[np.argmin(route_dists)].append(random_loc)
+            i_loc.remove(random_loc)
+
+        solution = [loc for route in routes for loc in route]
+        solution.append(0)
+        solution = np.array(solution, dtype=np.int32)
+
+        if check_depots_sanity(solution):
+            if check_capacity_criteria(problem, solution):
+                break
+    return solution
+
+def compute_solution(problem, solution, peso_alpha=1.0, peso_beta=1.0, peso_gamma=1.0):
+    """
+    Calcula el costo total de la solución usando la metodología del PDF:
+    C_ij = (peso_alpha * d_ij) + (peso_beta * t_ij) + (peso_gamma * o_ij)
+    """
+    cost = 0
+    routes = get_routes(solution)
+    
+    for route in routes:
+        if len(route) > 0:
+            # 1. Del depósito al primer cliente
+            nodo_origen = problem['depot_i']
+            nodo_destino = route[0]
+            
+            d_ij = problem['dists'][nodo_origen][nodo_destino]
+            t_ij = problem['times'][nodo_origen][nodo_destino]
+            o_ij = problem['op_costs'][nodo_origen][nodo_destino]
+            
+            cost += (peso_alpha * d_ij) + (peso_beta * t_ij) + (peso_gamma * o_ij)
+            
+            # 2. Entre los clientes de la ruta
+            for i in range(len(route) - 1):
+                actual = route[i]
+                siguiente = route[i+1]
+                
+                d_ij = problem['dists'][actual][siguiente]
+                t_ij = problem['times'][actual][siguiente]
+                o_ij = problem['op_costs'][actual][siguiente]
+                
+                cost += (peso_alpha * d_ij) + (peso_beta * t_ij) + (peso_gamma * o_ij)
+                
+            # 3. Del último cliente de regreso al depósito
+            nodo_final = route[-1]
+            nodo_regreso = problem['depot_i']
+            
+            d_ij = problem['dists'][nodo_final][nodo_regreso]
+            t_ij = problem['times'][nodo_final][nodo_regreso]
+            o_ij = problem['op_costs'][nodo_final][nodo_regreso]
+            
+            cost += (peso_alpha * d_ij) + (peso_beta * t_ij) + (peso_gamma * o_ij)
+            
+    return cost
+
+
+def check_solution(problem,
+                   solution,
+                   x=None,
+                   verbose=False) -> bool:
+    # sanity check №1
+    # len(solution) == n_locations + n_trucks
+    sol_len  = len(solution)
+    plan_len = problem['n_trucks'] + problem['n_locations']
+    if not sol_len == plan_len:
+        if verbose:
+            print('Solution len {} but should be {}' \
+                  .format(sol_len, plan_len))
+        return False
+
+    # sanity check №2
+    # The end and the start of the solution should be depot
+    depots = list(filter(lambda i: solution[i]==0, range(sol_len)))
+    if depots[0] != 0 or depots[-1] != sol_len-1:
+        if verbose:
+            print('The end and the start of the solution should be depots')
+            print(depots)
+        return False
+
+    # sanity check №3
+    # there shouldn`t be several depots in a row for example [0, 0,.. ]
+    for i in range(len(depots)-1):
+        if depots[i+1] - depots[i] <= 1:
+            if verbose:
+                print('Several depots in a row: {}'.format(depots))
+            return False
+
+    if  not isinstance(x, np.ndarray):
+        n = problem['n_locations']
+        x = np.zeros((n, n), dtype=np.int32)
+        for i, loc in enumerate(solution[:-1]):
+            x[solution[i], solution[i+1]] = 1
+
+    # sanity check №4
+    # all locations should be in the solution
+    if len(np.unique(solution)) != problem['n_locations']:
+        if verbose:
+            print('Failed locations sanity check')
+            for i in range(problem['n_locations']):
+                if i not in solution:
+                    print('Missing: {} location'.format(i))
+                    break
+        return False
+
+    # cruteria check №1
+    # Sum Xi0 = M For all i in V
+    # Sum X0j = M For all j in V and
+    # where M is the number of trucks
+    if not check_M_criteria(problem,
+                            solution,
+                            x=x,
+                            verbose=verbose):
+        return False
+
+    # criteria check №2
+    # Sum Xij = 1 For all j in V\{0} and
+    # Sum Xij = 1 For all i in V\{0}
+    if not check_One_criteria(problem,
+                              solution,
+                              x=x,
+                              verbose=verbose):
+        return False
+
+    # criteria check №3
+    # route  demand  <= truck capacity
+    if not check_capacity_criteria(problem,
+                                   solution,
+                                   verbose=verbose):
+        return False
+
+    return True
+
+
+def check_depots_sanity(solution):
+    sol_len = len(solution)
+    depots = list(filter(lambda i: solution[i]==0, range(sol_len)))
+    for i in range(len(depots)-1):
+        if abs(depots[i+1] - depots[i]) <= 1:
+            return False
+    return True
+
+def check_One_criteria(problem,
+                       solution,
+                       x=None,
+                       verbose=False) -> bool:
+    if not ((x.sum(axis=1)[1: ].sum() == problem['n_locations'] - 1) and
+            (x.sum(axis=0)[1: ].sum() == problem['n_locations'] - 1)):
+            if verbose:
+                print('Sum Xij for j = ', x.sum(axis=1)[1: ])
+                print('Sum Xij for j = ', x.sum(axis=0)[1: ])
+            return False
+
+    return True
+
+
+def check_M_criteria(problem,
+                     solution,
+                     x=None,
+                     verbose=False) -> bool:
+
+    if  not isinstance(x, np.ndarray):
+        n = problem['n_locations']
+        x = np.zeros((n, n), dtype=np.int32)
+        for i, loc in enumerate(solution[:-1]):
+            x[solution[i], solution[i+1]] = 1
+
+    if  not ((x[0, :].sum() == problem['n_trucks']) and
+              x[:, 0].sum() == problem['n_trucks']):
+        if verbose:
+            print('n_trucks =', problem['n_trucks'])
+            print('Sum Xi0 = ', x[:, 0].sum())
+            print('Sum X0j = ', x[0, :].sum())
+            print(solution)
+        return False
+
+    return True
+
+
+def check_capacity_criteria(problem,
+                            solution,
+                            verbose=False) -> bool:
+    capacity = problem['capacity']
+    routes_demand = get_routes_demand(problem, solution)
+    for route_demand in routes_demand:
+        if route_demand > capacity:
+            if verbose:
+                print('Route demand {} exeeds capacity {}' \
+                        .format(route_demand, capacity))
+                print('Route ', routes_demand)
+            return False
+    return True
+
+
+def get_routes(solution):
+    sol_len = len(solution)
+    depots  = list(filter(lambda i: solution[i]==0, range(sol_len)))
+    routes  = []
+    for i, d in  enumerate(depots[:-1]):
+        route = solution[depots[i]+1:depots[i+1]]
+        routes.append(route)
+    return routes
+
+
+def get_routes_demand(problem, _solution):
+    solution = copy(_solution)
+    sol_len = len(solution)
+    demands = problem['demands']
+    depots = list(filter(lambda i: solution[i]==0, range(sol_len)))
+    routes = []
+    for i, d in  enumerate(depots[:-1]):
+        route = solution[depots[i]+1:depots[i+1]]
+        route_demand = np.sum([demands[place] for place in route])
+        routes.append(route_demand)
+    return routes
